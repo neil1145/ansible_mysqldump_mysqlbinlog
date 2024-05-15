@@ -1,0 +1,204 @@
+---
+- name: Daily Backup of MySQL Databases and Binary Logs
+  hosts: localhost
+  gather_facts: yes
+  vars_files:
+    - vars.yml
+  vars:
+    sql_backup_dir: "/var/mysql_backup/{{ current_date }}/mysqldumps"
+    binlog_backup_dir: "/var/mysql_backup/{{ current_date }}/binlogs"
+    log_path: "/var/log/mysql_backup.log"
+
+  tasks:
+    - name: Log backup start
+      lineinfile:
+        path: "{{ log_path }}"
+        line: "Backup started on {{ current_date }}"
+        create: true
+      become: yes
+
+    - name: Ensure Azure storage account exists
+      shell: |
+        az storage account show --name {{ storage_account_name }} || \
+        az storage account create --name {{ storage_account_name }} --resource-group {{ resource_group }} --location {{ location }} --sku Standard_LRS
+      register: storage_account
+      ignore_errors: true
+
+    - name: Ensure container exists
+      command: >
+        az storage container create --account-name {{ storage_account_name }} --name backup-{{ current_date }}
+      register: storage_container
+      changed_when: storage_container.rc == 0
+
+    - name: Create SQL backup directory
+      file:
+        path: "{{ sql_backup_dir }}"
+        state: directory
+        mode: '0755'
+      become: yes
+
+    - name: Create binlog backup directory
+      file:
+        path: "{{ binlog_backup_dir }}"
+        state: directory
+        mode: '0755'
+      become: yes
+
+    - name: Ensure SQL backup directory is writable
+      file:
+        path: "{{ sql_backup_dir }}"
+        state: directory
+        owner: "{{ ansible_env.USER }}"
+        group: "{{ ansible_env.USER }}"
+        mode: '0755'
+      become: yes
+
+    - name: Ensure binlog backup directory is writable
+      file:
+        path: "{{ binlog_backup_dir }}"
+        state: directory
+        owner: "{{ ansible_env.USER }}"
+        group: "{{ ansible_env.USER }}"
+        mode: '0755'
+      become: yes
+
+    - name: Get list of databases
+      shell: "mysql -h {{ mysql_host }} -u {{ mysql_user }} -p{{ mysql_password }} -e 'SHOW DATABASES;' | grep -Ev 'Database|information_schema|performance_schema|mysql|sys'"
+      register: databases
+
+    - name: Display list of databases
+      debug:
+        var: databases.stdout_lines
+
+    - name: Dump individual databases
+      shell: |
+        for db in {{ databases.stdout_lines | join(" ") }}; do
+          sanitized_db=$(echo $db | tr -d '[:punct:]');
+          echo "Dumping database: $db"
+          mysqldump -h {{ mysql_host }} -u {{ mysql_user }} -p{{ mysql_password }} --databases $db --single-transaction --quick --lock-tables=false --set-gtid-purged=OFF > "{{ sql_backup_dir }}/$sanitized_db.sql";
+        done
+      args:
+        executable: /bin/bash
+      when: use_mysqldump
+      register: mysqldump_output
+      become: yes
+
+    - name: Log mysqldump command output
+      debug:
+        var: mysqldump_output
+
+    - name: Compress SQL dumps
+      shell: "tar -czf /var/mysql_backup/sql-backup-{{ current_date }}.tar.gz -C {{ sql_backup_dir }} ."
+      args:
+        executable: /bin/bash
+      when: use_mysqldump
+      register: compress_sql
+      become: yes
+
+    - name: List binary logs on MySQL server
+      shell: |
+        mysql -h {{ mysql_host }} -u {{ mysql_user }} -p{{ mysql_password }} -e "SHOW BINARY LOGS;" | awk '{print $1}' | grep -v 'Log_name'
+      args:
+        executable: /bin/bash
+      register: binlog_files
+      become: yes
+
+    - name: Debug binlog files output
+      debug:
+        var: binlog_files
+
+    - name: Download new binary logs from MySQL server
+      shell: |
+        for binlog in {{ binlog_files.stdout_lines | join(" ") }}; do
+          echo "Downloading binlog: $binlog";
+          mysqlbinlog --verify-binlog-checksum --host={{ mysql_host }} --port=3306 --user={{ mysql_user }} --password={{ mysql_password }} --raw --read-from-remote-server --result-file="{{ binlog_backup_dir }}/$binlog" $binlog;
+        done
+      args:
+        executable: /bin/bash
+      when: use_mysqlbinlog
+      register: mysqlbinlog_output
+      become: yes
+
+    - name: Rename downloaded binary logs
+      shell: |
+        for binlog in {{ binlog_files.stdout_lines | join(" ") }}; do
+          if [ -f "{{ binlog_backup_dir }}/$binlog$binlog" ]; then
+            mv "{{ binlog_backup_dir }}/$binlog$binlog" "{{ binlog_backup_dir }}/$binlog";
+          fi
+        done
+      args:
+        executable: /bin/bash
+      become: yes
+
+    - name: List files in binlog backup directory for debugging
+      command: ls -l "{{ binlog_backup_dir }}"
+      register: list_binlog_dir
+      ignore_errors: yes
+
+    - name: Display binlog backup directory contents
+      debug:
+        var: list_binlog_dir.stdout_lines
+
+    - name: Check if binary logs were downloaded
+      shell: "ls {{ binlog_backup_dir }}/mysql-bin.*"
+      register: binlog_files
+      failed_when: binlog_files.stdout == ""
+
+    - name: Compress binary logs
+      shell: "tar -czf /var/mysql_backup/binlog-backup-{{ current_date }}.tar.gz -C {{ binlog_backup_dir }} ."
+      args:
+        executable: /bin/bash
+      when: use_mysqlbinlog
+      register: compress_binlogs
+      become: yes
+
+    - name: Upload SQL dump to Azure
+      shell: "az storage blob upload --account-name {{ storage_account_name }} --container-name backup-{{ current_date }} --file /var/mysql_backup/sql-backup-{{ current_date }}.tar.gz --name sql-backup-{{ current_date }}.tar.gz"
+      register: upload_sql
+      when: use_mysqldump
+      changed_when: upload_sql.rc == 0
+
+    - name: Upload binary logs to Azure
+      shell: "az storage blob upload --account-name {{ storage_account_name }} --container-name backup-{{ current_date }} --file /var/mysql_backup/binlog-backup-{{ current_date }}.tar.gz --name binlog-backup-{{ current_date }}.tar.gz"
+      register: upload_binlogs
+      when: use_mysqlbinlog
+      changed_when: upload_binlogs.rc == 0
+
+    - name: Clean up local SQL backup directory
+      file:
+        path: "{{ sql_backup_dir }}"
+        state: absent
+      become: yes
+
+    - name: Clean up local binlog backup directory
+      file:
+        path: "{{ binlog_backup_dir }}"
+        state: absent
+      become: yes
+
+    - name: Clean up SQL backup archive
+      file:
+        path: "/var/mysql_backup/sql-backup-{{ current_date }}.tar.gz"
+        state: absent
+      become: yes
+
+    - name: Clean up binary logs archive
+      file:
+        path: "/var/mysql_backup/binlog-backup-{{ current_date }}.tar.gz"
+        state: absent
+      become: yes
+
+    - name: Clean up old backups
+      find:
+        paths: /var/mysql_backup/
+        age: "{{ backup_retention_days }}d"
+        age_stamp: mtime
+        recurse: yes
+      register: old_backups
+
+    - name: Remove old backups
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"
+      when: old_backups.matched > 0
